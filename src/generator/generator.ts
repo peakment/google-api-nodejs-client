@@ -11,17 +11,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import * as fs from 'fs';
+// eslint-disable-next-line node/no-unsupported-features/node-builtins
+import {promises as fs} from 'fs';
 import {GaxiosOptions, Headers} from 'gaxios';
 import {DefaultTransporter} from 'google-auth-library';
 import {
-  FragmentResponse,
   Schema,
   SchemaItem,
   SchemaMethod,
   SchemaParameters,
-  SchemaResource,
   Schemas,
+  SchemaMethods,
+  SchemaResources,
+  SchemaItems,
 } from 'googleapis-common';
 import * as mkdirp from 'mkdirp';
 import * as nunjucks from 'nunjucks';
@@ -29,12 +31,6 @@ import * as path from 'path';
 import {URL} from 'url';
 import * as util from 'util';
 import Q from 'p-queue';
-
-const writeFile = util.promisify(fs.writeFile);
-const readDir = util.promisify(fs.readdir);
-
-const FRAGMENT_URL =
-  'https://storage.googleapis.com/apisnippets-staging/public/';
 
 const srcPath = path.join(__dirname, '../../../src');
 const TEMPLATES_DIR = path.join(srcPath, 'generator/templates');
@@ -66,6 +62,29 @@ function isSimpleType(type: string): boolean {
     return false;
   }
   return true;
+}
+
+/**
+ * Attempt to turn a regex into a more human readable form.
+ * @param regex pattern for the given parameter
+ */
+function unRegex(regex: string): string {
+  // example: ^projects/[^/]+$' ==> projects/my-project
+  let pattern = regex;
+  if (typeof regex !== 'string') {
+    return '';
+  }
+  // remove leading ^
+  if (pattern.startsWith('^')) {
+    pattern = pattern.slice(1);
+  }
+  // remove trailing $
+  if (pattern.endsWith('$')) {
+    pattern = pattern.slice(0, pattern.length - 1);
+  }
+  // replace projects placeholders
+  pattern = pattern.replace(/\^?(\w+)s\/\[\^\/\]\+\$?/g, '$1s/my-$1');
+  return pattern;
 }
 
 function cleanPropertyName(prop: string) {
@@ -178,6 +197,7 @@ export class Generator {
     this.env.addFilter('oneLine', this.oneLine);
     this.env.addFilter('getType', getType);
     this.env.addFilter('cleanPropertyName', cleanPropertyName);
+    this.env.addFilter('unRegex', unRegex);
     this.env.addFilter('cleanComments', this.cleanComments);
     this.env.addFilter('camelify', camelify);
     this.env.addFilter('getPathParams', this.getPathParams);
@@ -259,6 +279,7 @@ export class Generator {
               `GenerateAPI call failed with error: ${e}, moving on.`
             );
             console.error(`Failed to generate API: ${api.id}`);
+            console.error(e);
             console.log(
               api.id +
                 '\n-----------\n' +
@@ -275,6 +296,7 @@ export class Generator {
       await queue.onIdle();
       await this.generateIndex(apis);
     } catch (e) {
+      console.error(e);
       console.log(util.inspect(this.state, {maxArrayLength: null}));
     }
   }
@@ -286,14 +308,14 @@ export class Generator {
     const rootIndexPath = path.join(apisPath, '../', 'index.ts');
 
     // Dynamically discover available APIs
-    const files: string[] = await readDir(apisPath);
+    const files: string[] = await fs.readdir(apisPath);
     for (const file of files) {
       const filePath = path.join(apisPath, file);
-      if (!(await util.promisify(fs.stat)(filePath)).isDirectory()) {
+      if (!(await fs.stat(filePath)).isDirectory()) {
         continue;
       }
       apis[file] = {};
-      const files: string[] = await readDir(path.join(apisPath, file));
+      const files: string[] = await fs.readdir(path.join(apisPath, file));
       for (const version of files) {
         const parts = path.parse(version);
         if (!version.endsWith('.d.ts') && parts.ext === '.ts') {
@@ -305,104 +327,37 @@ export class Generator {
             name: file,
             api: apis[file],
           });
-          await writeFile(apiIdxPath, result);
+          await fs.writeFile(apiIdxPath, result);
           // generate the package.json
           const pkgPath = path.join(apisPath, file, 'package.json');
           const pkgResult = this.env.render('package.json.njk', {
             name: file,
             desc,
           });
-          await writeFile(pkgPath, pkgResult);
+          await fs.writeFile(pkgPath, pkgResult);
           // generate the README.md
           const rdPath = path.join(apisPath, file, 'README.md');
           const rdResult = this.env.render('README.md.njk', {name: file, desc});
-          await writeFile(rdPath, rdResult);
+          await fs.writeFile(rdPath, rdResult);
           // generate the tsconfig.json
           const tsPath = path.join(apisPath, file, 'tsconfig.json');
           const tsResult = this.env.render('tsconfig.json.njk');
-          await writeFile(tsPath, tsResult);
+          await fs.writeFile(tsPath, tsResult);
           // generate the webpack.config.js
           const wpPath = path.join(apisPath, file, 'webpack.config.js');
           const wpResult = this.env.render('webpack.config.js.njk', {
             name: file,
           });
-          await writeFile(wpPath, wpResult);
+          await fs.writeFile(wpPath, wpResult);
         }
       }
     }
 
     const result = this.env.render('index.njk', {apis});
-    await writeFile(indexPath, result, {encoding: 'utf8'});
+    await fs.writeFile(indexPath, result, {encoding: 'utf8'});
 
     const res2 = this.env.render('root-index.njk', {apis});
-    await writeFile(rootIndexPath, res2, {encoding: 'utf8'});
-  }
-
-  /**
-   * Given a discovery doc, parse it and recursively iterate over the various
-   * embedded links.
-   */
-  private getFragmentsForSchema(
-    apiDiscoveryUrl: string,
-    schema: SchemaResource,
-    apiPath: string,
-    tasks: Array<() => Promise<void>>
-  ) {
-    if (schema.methods) {
-      for (const methodName in schema.methods) {
-        // eslint-disable-next-line no-prototype-builtins
-        if (schema.methods.hasOwnProperty(methodName)) {
-          const methodSchema = schema.methods[methodName];
-          methodSchema.sampleUrl = apiPath + '.' + methodName + '.frag.json';
-          tasks.push(async () => {
-            this.logResult(apiDiscoveryUrl, 'Making fragment request...');
-            this.logResult(apiDiscoveryUrl, methodSchema.sampleUrl);
-            try {
-              const res = await this.request<FragmentResponse>({
-                url: methodSchema.sampleUrl,
-              });
-              this.logResult(apiDiscoveryUrl, 'Fragment request complete.');
-              if (
-                res.data &&
-                res.data.codeFragment &&
-                res.data.codeFragment['Node.js']
-              ) {
-                let fragment = res.data.codeFragment['Node.js'].fragment;
-                fragment = fragment.replace(/\/\*/gi, '/<');
-                fragment = fragment.replace(/\*\//gi, '>/');
-                fragment = fragment.replace(/`\*/gi, '`<');
-                fragment = fragment.replace(/\*`/gi, '>`');
-                const lines = fragment.split('\n');
-                lines.forEach((line: string, i: number) => {
-                  lines[i] = '*' + (line ? ' ' + lines[i] : '');
-                });
-                fragment = lines.join('\n');
-                methodSchema.fragment = fragment;
-              }
-            } catch (err) {
-              this.logResult(apiDiscoveryUrl, `Fragment request err: ${err}`);
-              if (!err.message || err.message.indexOf('AccessDenied') === -1) {
-                throw err;
-              }
-              this.logResult(apiDiscoveryUrl, 'Ignoring error.');
-            }
-          });
-        }
-      }
-    }
-    if (schema.resources) {
-      for (const resourceName in schema.resources) {
-        // eslint-disable-next-line no-prototype-builtins
-        if (schema.resources.hasOwnProperty(resourceName)) {
-          this.getFragmentsForSchema(
-            apiDiscoveryUrl,
-            schema.resources[resourceName],
-            apiPath + '.' + resourceName,
-            tasks
-          );
-        }
-      }
-    }
+    await fs.writeFile(rootIndexPath, res2, {encoding: 'utf8'});
   }
 
   /**
@@ -413,7 +368,7 @@ export class Generator {
     const parts = new URL(apiDiscoveryUrl);
     if (apiDiscoveryUrl && !parts.protocol) {
       this.log('Reading from file ' + apiDiscoveryUrl);
-      const file = await util.promisify(fs.readFile)(apiDiscoveryUrl, {
+      const file = await fs.readFile(apiDiscoveryUrl, {
         encoding: 'utf-8',
       });
       await this.generate(apiDiscoveryUrl, JSON.parse(file));
@@ -428,20 +383,12 @@ export class Generator {
   private async generate(apiDiscoveryUrl: string, schema: Schema) {
     this.logResult(apiDiscoveryUrl, 'Discovery doc request complete.');
     const tasks = new Array<() => Promise<void>>();
-    this.getFragmentsForSchema(
-      apiDiscoveryUrl,
-      schema,
-      `${FRAGMENT_URL}${schema.name}/${schema.version}/0/${schema.name}`,
-      tasks
-    );
 
-    // e.g. apis/drive/v2.js
-    const exportFilename = path.join(
-      srcPath,
-      'apis',
-      schema.name,
-      schema.version + '.ts'
-    );
+    // e.g. apis/drive
+    const apiPath = path.join(srcPath, 'apis', schema.name);
+    // e.g. apis/drive/v1.ts
+    const exportFilename = path.join(apiPath, schema.version + '.ts');
+
     this.logResult(apiDiscoveryUrl, 'Generating templates...');
     this.logResult(apiDiscoveryUrl, 'Step 1...');
     await Promise.all(tasks.map(t => t()));
@@ -449,10 +396,99 @@ export class Generator {
     const contents = this.env.render(API_TEMPLATE, {api: schema});
     await mkdirp(path.dirname(exportFilename));
     this.logResult(apiDiscoveryUrl, 'Step 3...');
-    await writeFile(exportFilename, contents, {encoding: 'utf8'});
+    await fs.writeFile(exportFilename, contents, {encoding: 'utf8'});
     this.logResult(apiDiscoveryUrl, 'Template generation complete.');
+
+    // Generate samples
+    const samplesPath = path.join(apiPath, 'samples', schema.version);
+    await mkdirp(samplesPath);
+    const methods = new Array<SchemaMethod>();
+    getAllMethods(schema, methods);
+    for (const method of methods) {
+      const samplePath = path.join(samplesPath, `${method.id}.js`);
+      let responseExample: undefined | {};
+      if (method.response) {
+        const item = schema.schemas[method.response.$ref!];
+        responseExample = flattenSchema(item, schema.schemas);
+      }
+      let requestExample: {} | undefined;
+      if (method.request) {
+        const item = schema.schemas[method.request.$ref!];
+        requestExample = flattenSchema(item, schema.schemas);
+      }
+      const sampleResult = this.env.render('sample.njk', {
+        api: schema,
+        method,
+        responseExample,
+        requestExample,
+      });
+      await fs.writeFile(samplePath, sampleResult);
+    }
     return exportFilename;
   }
+}
+
+/**
+ * Provide a flattened representation of what the structure for a
+ * given request or response could look like.
+ */
+function flattenSchema(item: SchemaItem, schemas: SchemaItems) {
+  // tslint:disable-next-line no-any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const result: any = {};
+  if (item.properties) {
+    for (const [name, details] of Object.entries(item.properties)) {
+      result[name] = getExamplePropertyValue(name, details, schemas);
+    }
+  }
+  return result;
+}
+
+function getExamplePropertyValue(
+  name: string,
+  details: SchemaItem,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  schemas: SchemaItems
+): {} {
+  switch (details.type) {
+    case 'string':
+      return `my_${name}`;
+    case 'boolean':
+      return false;
+    case 'object':
+      return {};
+    case 'integer':
+      return 0;
+    case 'array':
+      return [];
+    default:
+      return {};
+  }
+}
+
+interface MethodBag {
+  methods?: SchemaMethods;
+  resources?: SchemaResources;
+}
+
+/**
+ * Iterate over items in the schema recursively, and return a flattened
+ * list of all methods.
+ * @param bag
+ * @param methods
+ */
+function getAllMethods(bag: MethodBag, methods: SchemaMethod[]) {
+  if (bag.methods) {
+    for (const m of Object.keys(bag.methods)) {
+      methods.push(bag.methods[m]);
+    }
+  }
+  if (bag.resources) {
+    for (const r of Object.keys(bag.resources)) {
+      getAllMethods(bag.resources[r], methods);
+    }
+  }
+  return methods;
 }
 
 /**
